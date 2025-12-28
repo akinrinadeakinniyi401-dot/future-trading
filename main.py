@@ -1,7 +1,6 @@
 import os
 import time
 import logging
-import numpy as np
 import pandas as pd
 
 from telegram import (
@@ -17,6 +16,7 @@ from telegram.ext import (
 )
 
 from pybit.unified_trading import HTTP
+from pybit.exceptions import FailedRequestError
 import ta
 
 # ================== CONFIG ==================
@@ -40,6 +40,11 @@ session = HTTP(
     api_secret=API_SECRET
 )
 
+# ================== RATE LIMIT + CACHE ==================
+LAST_CALL = 0
+CACHE = {}
+CACHE_TTL = 30  # seconds
+
 # ================== MENU ==================
 def main_menu():
     return InlineKeyboardMarkup([
@@ -54,19 +59,35 @@ def back_menu():
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")]
     ])
 
-# ================== STRATEGY ==================
+# ================== STRATEGY (SAFE) ==================
 def analyze_symbol(symbol):
-    k = session.get_kline(
-        category="linear",
-        symbol=symbol,
-        interval=5,
-        limit=100
-    )
+    global LAST_CALL
+
+    now = time.time()
+
+    # Cache hit
+    if symbol in CACHE and now - CACHE[symbol]["time"] < CACHE_TTL:
+        return CACHE[symbol]["score"], CACHE[symbol]["price"]
+
+    # Rate limit protection
+    if now - LAST_CALL < 1.2:
+        time.sleep(1.2)
+
+    LAST_CALL = time.time()
+
+    try:
+        k = session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=5,
+            limit=50
+        )
+    except FailedRequestError:
+        return 0, 0
 
     df = pd.DataFrame(k["result"]["list"])
     df = df.iloc[::-1]
     df.columns = ["time","open","high","low","close","volume","turnover"]
-
     df["close"] = df["close"].astype(float)
 
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
@@ -80,6 +101,12 @@ def analyze_symbol(symbol):
         score += 1
     if latest["rsi"] < 70:
         score += 1
+
+    CACHE[symbol] = {
+        "score": score,
+        "price": latest["close"],
+        "time": now
+    }
 
     return score, latest["close"]
 
@@ -99,72 +126,99 @@ async def scan_market(update: Update, context):
     query = update.callback_query
     await query.answer()
 
-    best = None
-    best_score = -1
+    try:
+        best = None
+        best_score = -1
 
-    for sym in SYMBOLS:
-        score, price = analyze_symbol(sym)
-        if score > best_score:
-            best_score = score
-            best = sym
+        for sym in SYMBOLS:
+            score, _ = analyze_symbol(sym)
+            if score > best_score:
+                best_score = score
+                best = sym
 
-    await query.edit_message_text(
-        f"📊 Best Setup Found:\n\n🔹 {best}\nScore: {best_score}",
-        reply_markup=back_menu()
-    )
+        if not best:
+            raise Exception("No data")
+
+        await query.edit_message_text(
+            f"📊 Best Setup Found:\n\n🔹 {best}\nScore: {best_score}",
+            reply_markup=back_menu()
+        )
+
+    except Exception:
+        await query.edit_message_text(
+            "⚠️ Bybit rate limit reached.\nPlease wait 30 seconds.",
+            reply_markup=back_menu()
+        )
 
 async def open_trade(update: Update, context):
     query = update.callback_query
     await query.answer()
 
-    best = None
-    best_score = -1
+    try:
+        best = None
+        best_score = -1
 
-    for sym in SYMBOLS:
-        score, price = analyze_symbol(sym)
-        if score > best_score:
-            best_score = score
-            best = sym
+        for sym in SYMBOLS:
+            score, _ = analyze_symbol(sym)
+            if score > best_score:
+                best_score = score
+                best = sym
 
-    session.set_leverage(
-        category="linear",
-        symbol=best,
-        buyLeverage=LEVERAGE,
-        sellLeverage=LEVERAGE
-    )
+        if not best:
+            raise Exception("No trade")
 
-    session.place_order(
-        category="linear",
-        symbol=best,
-        side="Buy",
-        orderType="Market",
-        qty=TRADE_USDT,
-        timeInForce="GoodTillCancel"
-    )
+        session.set_leverage(
+            category="linear",
+            symbol=best,
+            buyLeverage=LEVERAGE,
+            sellLeverage=LEVERAGE
+        )
 
-    await query.edit_message_text(
-        f"📈 Trade Opened on {best}",
-        reply_markup=back_menu()
-    )
+        session.place_order(
+            category="linear",
+            symbol=best,
+            side="Buy",
+            orderType="Market",
+            qty=TRADE_USDT,
+            timeInForce="GoodTillCancel"
+        )
+
+        await query.edit_message_text(
+            f"📈 Trade Opened on {best}",
+            reply_markup=back_menu()
+        )
+
+    except Exception:
+        await query.edit_message_text(
+            "⚠️ Trade failed (rate limit / API block).\nTry again later.",
+            reply_markup=back_menu()
+        )
 
 async def close_trade(update: Update, context):
     query = update.callback_query
     await query.answer()
 
-    for sym in SYMBOLS:
-        session.place_order(
-            category="linear",
-            symbol=sym,
-            side="Sell",
-            orderType="Market",
-            qty=TRADE_USDT,
-            reduceOnly=True
+    try:
+        for sym in SYMBOLS:
+            session.place_order(
+                category="linear",
+                symbol=sym,
+                side="Sell",
+                orderType="Market",
+                qty=TRADE_USDT,
+                reduceOnly=True
+            )
+
+        await query.edit_message_text(
+            "📉 All positions closed",
+            reply_markup=back_menu()
         )
 
-    await query.edit_message_text(
-        "📉 All positions closed",
-        reply_markup=back_menu()
-    )
+    except Exception:
+        await query.edit_message_text(
+            "⚠️ Close failed due to rate limit.",
+            reply_markup=back_menu()
+        )
 
 async def status(update: Update, context):
     query = update.callback_query
@@ -175,6 +229,10 @@ async def status(update: Update, context):
         reply_markup=back_menu()
     )
 
+# ================== GLOBAL ERROR HANDLER ==================
+async def error_handler(update, context):
+    logging.error("Telegram error", exc_info=context.error)
+
 # ================== RUN ==================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -184,5 +242,7 @@ app.add_handler(CallbackQueryHandler(scan_market, pattern="scan"))
 app.add_handler(CallbackQueryHandler(open_trade, pattern="trade"))
 app.add_handler(CallbackQueryHandler(close_trade, pattern="close"))
 app.add_handler(CallbackQueryHandler(status, pattern="status"))
+
+app.add_error_handler(error_handler)
 
 app.run_polling()
